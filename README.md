@@ -1,52 +1,58 @@
 # Syzagent
 
-`Syzagent` is a minimal, runnable bundle around `source/syzdirect/Runner/run_hunt.py`.
+`Syzagent`는 `source/syzdirect/Runner/run_hunt.py`를 중심으로, 신규 Linux kernel CVE를 바로 넣어서 SyzDirect hunting pipeline을 돌릴 수 있게 정리한 최소 실행 번들입니다.
 
-The goal is not to preserve the entire original SyzDirect research tree. The goal is to keep only the pieces required to take a fresh Linux kernel CVE and run a practical hunting pipeline:
+핵심 목적은 하나입니다.
 
-1. resolve or accept the target CVE metadata
-2. prepare kernel source at the vulnerable or fixed revision
-3. build LLVM bitcode
-4. analyze kernel interfaces
-5. analyze the target point
-6. instrument distance
-7. fuzz directly, or fuzz with an iterative agent loop
+- 논문이나 공식 repo의 고정 `dataset.xlsx` 샘플만 재현하는 것이 아니라
+- 새로운 CVE를 넣었을 때도
+- source 준비, bitcode 빌드, interface 분석, target point 분석, distance instrumentation, fuzzing까지
+- 가능한 한 자동으로 이어지게 만드는 것
 
-This repository is intended for "new CVE in, automated hunt out" workflows rather than replaying only a fixed paper dataset.
+이 저장소는 원본 SyzDirect 전체를 보존하려는 프로젝트가 아닙니다. `run_hunt.py`가 실제로 동작하는 데 필요한 구성만 남기고, 신규 CVE 자동화에서 자주 깨지는 지점을 runner 쪽에서 방어적으로 흡수하는 데 초점을 둡니다.
 
-## What This Project Is
+## 이 프로젝트가 정확히 무엇인가
 
-The original SyzDirect toolchain is split across several components:
+원본 SyzDirect는 크게 다음 구성으로 나뉩니다.
 
-- `syzdirect_function_model`: kernel interface extraction
-- `syzdirect_kernel_analysis`: target point analysis
-- `syzdirect_fuzzer`: Syzkaller-derived fuzzing side
+- `syzdirect_function_model`
+  커널 interface 추출
+- `syzdirect_kernel_analysis`
+  target point 분석
+- `syzdirect_fuzzer`
+  Syzkaller 기반 퍼징 실행부
 
-`run_hunt.py` is the wrapper that connects these pieces into a single pipeline for a new CVE. This repository keeps the wrapper and the minimal binaries/configuration it needs, then adds practical automation around the fragile points that usually break when you try to use SyzDirect on a CVE that was not pre-curated in `dataset.xlsx`.
+`run_hunt.py`는 이 조각들을 하나의 실행 흐름으로 묶는 래퍼입니다. `Syzagent`는 이 래퍼를 중심으로 다음을 가능하게 하려는 저장소입니다.
 
-In practice, `Syzagent` is:
+- CVE만 주고 필요한 메타데이터를 자동 추론
+- 중간 stage부터 재시작
+- 퍼징 전에 필요한 입력물 자동 복구
+- syscall callfile을 LLM과 heuristic으로 보강
+- 퍼징 도중 상태를 보고 멈췄다가 더 좋은 템플릿으로 다시 돌리는 agent loop 운영
 
-- a thin orchestration layer over the official SyzDirect binaries
-- a CVE-oriented runner
-- a restartable multi-stage pipeline
-- a place to insert LLM-assisted syscall selection and iterative fuzz-template improvement
+즉, `Syzagent`는 다음 성격을 가집니다.
 
-It is not:
+- 공식 SyzDirect 바이너리를 감싸는 오케스트레이션 레이어
+- CVE 중심의 실행기
+- 재시작 가능한 stage 기반 파이프라인
+- LLM 기반 syscall 추론과 agent 기반 템플릿 강화 실험 지점
 
-- the full original research repository
-- a polished production framework
-- a replacement for Syzkaller itself
+반대로 다음은 아닙니다.
 
-## Repository Layout
+- 원본 연구 repo 전체
+- 완전히 제품화된 범용 퍼징 프레임워크
+- Syzkaller 자체를 대체하는 도구
 
-Included in this trimmed repository:
+## 어떤 파일이 들어 있는가
+
+이 저장소에는 `run_hunt.py`를 돌리는 데 필요한 핵심 파일만 들어 있습니다.
 
 - `source/syzdirect/Runner/`
-  - `run_hunt.py`: main entrypoint
-  - `Fuzz.py`: fuzz launch logic
-  - `Config.py`: runner config helpers
-  - `cve_resolver.py`: CVE -> commit/function/file auto-resolution
-  - `SyscallAnalyze/`: target-point and interface post-processing logic
+  - `run_hunt.py`
+  - `Fuzz.py`
+  - `Config.py`
+  - `cve_resolver.py`
+  - `SyscallAnalyze/`
 - `source/syzdirect/kcov.diff`
 - `source/syzdirect/bigconfig`
 - `source/syzdirect/template_config`
@@ -62,123 +68,99 @@ Included in this trimmed repository:
   - `target_analyzer`
   - `configs/`
 
-Excluded on purpose:
+의도적으로 제외한 것:
 
-- old datasets
-- old experiment outputs
-- large ad hoc workdirs
-- unrelated research or debugging notes
+- 기존 dataset
+- 예전 실험 결과물
+- 대용량 workdir
+- 부가 메모나 임시 디버깅 파일
 
-## High-Level Flow
+## 전체 구조 한눈에 보기
 
-The main pipeline in `run_hunt.py` is:
+`run_hunt.py`의 신규 CVE 파이프라인은 다음 6단계입니다.
 
 ```text
 source -> bitcode -> analyze -> target -> distance -> fuzz
 ```
 
-The corresponding implementation is the `NewCVEPipeline` class.
+조금 더 운영 관점에서 보면 다음 그림으로 이해하면 됩니다.
 
-### Stage 1. `source`
+```text
+            +-----------------------+
+            |   CVE / commit /      |
+            |  function / file      |
+            +-----------+-----------+
+                        |
+                        v
+            +-----------------------+
+            |  source 준비          |
+            |  - linux checkout     |
+            |  - commit 검증/fetch  |
+            |  - kcov patch         |
+            +-----------+-----------+
+                        |
+                        v
+            +-----------------------+
+            |  bitcode build        |
+            |  - emit-llvm wrapper  |
+            |  - kernel build       |
+            |  - .llbc 생성         |
+            +-----------+-----------+
+                        |
+                        v
+            +-----------------------+
+            |  interface analyze    |
+            |  - interface_generator|
+            |  - k2s mapping        |
+            |  - bad llbc 격리      |
+            +-----------+-----------+
+                        |
+                        v
+            +-----------------------+
+            |  target analyze       |
+            |  - target point       |
+            |  - tfinfo 생성/보정   |
+            |  - callfile 생성      |
+            +-----------+-----------+
+                        |
+                        v
+            +-----------------------+
+            | distance instrument   |
+            | - instrumented kernel |
+            | - bzImage / vmlinux   |
+            +-----------+-----------+
+                        |
+                        v
+            +-----------------------+
+            | fuzz / agent loop     |
+            | - syz-manager         |
+            | - metrics/log 분석    |
+            | - callfile 강화       |
+            +-----------------------+
+```
 
-Prepare a Linux tree for the target commit.
+## 왜 이런 래퍼가 필요한가
 
-What happens:
+신규 CVE를 넣어 자동화하려고 하면 보통 아래 같은 지점에서 자주 깨집니다.
 
-- clone from a local template repo if provided, otherwise clone `torvalds/linux`
-- verify that the requested commit exists locally
-- if it is missing, fetch the commit first
-- check out the target revision
-- apply `kcov.diff`
-- relax some build constraints to make kernel building more automation-friendly
+- 로컬 repo에 commit object가 없는데 바로 `git checkout`을 시도
+- 최신 kernel bitcode에서 `interface_generator`가 특정 `.llbc` 때문에 죽음
+- `template_config`가 빠져 있어 fuzz 단계 직전에 깨짐
+- `target_functions_info.txt`가 비어서 fuzz가 사실상 no-op가 됨
+- callfile이 비거나 syzkaller syscall 이름과 맞지 않아 target call이 disable됨
+- 퍼징은 돌지만 coverage가 늘지 않아 사실상 잘못된 syscall chain으로 시간을 낭비
 
-This matters because a common failure mode for fresh CVEs is asking Git to `checkout` a commit object that was never fetched. The runner now validates and fetches first instead of failing late with a vague checkout error.
+이 저장소는 이런 문제를 원본 도구 자체를 크게 바꾸기보다 runner 쪽에서 흡수하는 방향을 택합니다.
 
-### Stage 2. `bitcode`
+## 주요 실행 모드
 
-Build the kernel with LLVM bitcode emission enabled.
-
-What happens:
-
-- generate an `emit-llvm.sh` wrapper
-- copy the chosen kernel config, usually `bigconfig`
-- append required build options
-- run `olddefconfig`
-- build the kernel and emit `.llbc` side products
-
-The key expected artifact is:
-
-- `arch/x86/boot/bzImage`
-
-### Stage 3. `analyze`
-
-Run the SyzDirect interface extraction step.
-
-What happens:
-
-- generate syzkaller feature signatures if needed
-- run `interface_generator`
-- build the kernel-to-syzkaller mapping (`kernelToSyscall.json`)
-
-This is one of the most fragile stages on newer kernels. The wrapper adds a retry-and-quarantine flow for bad `.llbc` files:
-
-- if `interface_generator` crashes or reports a bad `.llbc`
-- the suspected file is moved into a quarantine directory outside the analysis tree
-- a skip manifest is recorded
-- the interface stage is retried
-
-This keeps one bad bitcode file from repeatedly poisoning the whole run.
-
-### Stage 4. `target`
-
-Run target point analysis and prepare fuzzing inputs.
-
-What happens:
-
-- write the positive target point list for the requested function
-- generate the SyzDirect target-relation map
-- run `target_analyzer`
-- ensure `target_functions_info.txt` exists
-- invoke `PrepareForFuzzing`
-- if that produces no usable callfile, fall back to generated inputs
-
-The wrapper now defends against a subtle but dangerous failure mode: the stage may appear to complete, but `target_functions_info.txt` can still be empty and the fuzz stage may effectively do nothing. The runner now forces a minimal `0 <function> <file>` entry when necessary and verifies that required fuzz inputs exist before launching fuzzing.
-
-### Stage 5. `distance`
-
-Build the distance-instrumented kernel.
-
-What happens:
-
-- choose the target function index
-- locate the computed distance directory
-- generate the required `Makefile.kcov` wiring
-- rebuild the kernel with distance instrumentation
-- copy out instrumented `bzImage` and optionally `vmlinux`
-
-### Stage 6. `fuzz`
-
-Launch SyzDirect fuzzing.
-
-What happens:
-
-- verify `tfinfo`, `callfile`, and `bzImage` before starting
-- regenerate missing callfiles when possible
-- normalize syscall names so they match actual syzkaller names
-- create per-target Syzkaller manager config
-- run `syz-manager`
-
-The runner now uses dynamic HTTP port allocation in normal fuzz mode so multiple runs do not collide on a fixed port.
-
-## Modes of Operation
-
-There are three useful modes.
+`run_hunt.py`는 크게 세 가지 방식으로 사용할 수 있습니다.
 
 ### 1. `new`
 
-The main path for a fresh CVE.
+신규 CVE를 위한 메인 모드입니다.
 
-Example:
+예시:
 
 ```bash
 cd source/syzdirect/Runner
@@ -192,13 +174,16 @@ python3 run_hunt.py -j 8 -uptime 24 new \
   --agent-uptime 6
 ```
 
-You can provide all metadata manually, or provide only the CVE and let the resolver try to fill the rest.
+이 모드는 다음 두 형태로 쓸 수 있습니다.
+
+- `--commit`, `--function`, `--file`까지 직접 주는 수동 모드
+- `--cve`만 주고 일부를 자동 추론하는 반자동 모드
 
 ### 2. `dataset`
 
-Compatibility path for the original SyzDirect dataset-based workflow.
+원본 SyzDirect의 dataset 기반 흐름을 호환용으로 남겨 둔 모드입니다.
 
-Example:
+예시:
 
 ```bash
 python3 run_hunt.py dataset -dataset dataset.xlsx -j 8 \
@@ -207,68 +192,195 @@ python3 run_hunt.py dataset -dataset dataset.xlsx -j 8 \
   instrument_kernel_with_distance fuzz
 ```
 
+신규 CVE 자동화가 주 목적이라면 보통은 `new` 모드를 쓰면 됩니다.
+
 ### 3. `fuzz`
 
-Fuzz prebuilt targets only.
+이미 준비된 target에 대해 fuzz만 다시 돌리고 싶을 때 쓰는 모드입니다.
 
-This is useful when the source/bitcode/analysis work is already complete and you only want to iterate on fuzzing.
-
-Example:
+예시:
 
 ```bash
 python3 run_hunt.py fuzz --targets 0 -uptime 12 --agent-rounds 5
 ```
 
-## How CVE Resolution Works
+이 모드는 source, bitcode, analysis를 다시 하지 않고 퍼징 쪽 반복 실험만 하고 싶을 때 유용합니다.
 
-If `--commit`, `--function`, or `--file` is missing in `new` mode, `run_hunt.py` calls `cve_resolver.py`.
+## 신규 CVE 파이프라인 상세 설명
 
-The resolver tries to find the fix commit from these sources, in order:
+### 1단계: `source`
 
-1. Linux kernel CVE list: `git.kernel.org/pub/scm/linux/security/vulns.git`
-2. NVD API: `services.nvd.nist.gov`
-3. GitHub commit search: `api.github.com`
+목표 commit 기준으로 Linux source tree를 준비합니다.
 
-Then it:
+무엇을 하나:
 
-1. fetches the patch for the fix commit
-2. parses the patch to infer the most relevant changed `.c` file
-3. extracts the most likely function from hunk headers
-4. uses `fix_commit~1` as the vulnerable checkout revision
+- 로컬 linux template repo가 있으면 거기서 clone
+- 없으면 `torvalds/linux`를 clone
+- 요청한 commit이 로컬 object로 존재하는지 먼저 검증
+- 없으면 fetch 시도
+- 그래도 없으면 stage1에서 명확하게 실패
+- checkout 후 `kcov.diff` 적용
+- 자동 빌드에 필요한 완화 처리 수행
 
-Why `fix_commit~1` instead of the `Fixes:` tag?
+왜 중요한가:
 
-- the `Fixes:` tag often points to the original introducing commit, which may be much older
-- older commits are harder to fetch in shallow workflows
-- `fix~1` is the most recent vulnerable state and is the right default for quick reproduction
+신규 CVE 자동화에서 자주 보는 오류가 다음입니다.
 
-### Example: auto-resolve from CVE only
+```text
+fatal: reference is not a tree
+fatal: pathspec '...' did not match any file(s) known to git
+```
+
+원인은 checkout 자체가 아니라 "그 commit object를 로컬이 아직 모른다"는 점입니다. 이 runner는 checkout 전에 commit 존재를 확인하고, 필요하면 fetch를 먼저 시도합니다.
+
+### 2단계: `bitcode`
+
+LLVM bitcode를 뽑을 수 있도록 kernel을 빌드합니다.
+
+무엇을 하나:
+
+- `emit-llvm.sh` wrapper 생성
+- kernel config 복사, 일반적으로 `bigconfig`
+- 필요한 빌드 옵션 추가
+- `olddefconfig`
+- 실제 kernel build
+- `.llbc` 산출물 생성
+
+핵심 산출물:
+
+- `arch/x86/boot/bzImage`
+- 각 object에 대응되는 `.llbc`
+
+### 3단계: `analyze`
+
+`interface_generator`를 통해 kernel interface를 추출합니다.
+
+무엇을 하나:
+
+- syzkaller feature signature 생성
+- `interface_generator` 실행
+- kernel-to-syzkaller 매핑 파일 생성
+
+이 단계는 최신 kernel에서 특히 잘 깨집니다. 대표적으로:
+
+- `Invalid value reference from metadata`
+- 특정 `.llbc` 로딩 실패
+- 특정 `.llbc` 처리 중 segfault
+
+그래서 runner는 다음 방어 로직을 추가합니다.
+
+- 실패 로그에서 문제 `.llbc` 후보를 추출
+- 해당 파일을 quarantine 디렉터리로 이동
+- quarantine 위치는 analysis tree 바깥이라 다음 스캔에 다시 안 잡힘
+- skip manifest 저장
+- 재실행 시 이전에 격리한 파일을 다시 건드리지 않음
+
+즉, "한 개의 나쁜 bitcode 파일 때문에 전체 분석이 매번 죽는 상황"을 완화합니다.
+
+### 4단계: `target`
+
+취약 함수까지 도달하기 위한 target point 분석과 fuzz 입력 생성 단계입니다.
+
+무엇을 하나:
+
+- target function을 positive point로 기록
+- SyzDirect target relation map 생성
+- `target_analyzer` 실행
+- `target_functions_info.txt` 생성 또는 보정
+- `PrepareForFuzzing` 호출
+- 결과가 비면 fallback callfile 생성
+
+이 단계에서 흔한 함정:
+
+- 로그상으로는 끝난 것처럼 보이는데
+- `target_functions_info.txt`가 비어 있음
+- callfile도 비어 있거나 없음
+- fuzz/agent loop는 돌지만 실제 target syscall은 한 번도 안 탐
+
+이 저장소의 runner는 이 문제를 막기 위해:
+
+- `tfinfo`가 비면 최소 `0 <function> <file>` 엔트리 강제 생성
+- callfile이 없거나 비면 자동 생성 또는 재생성
+- xidx 0 callfile을 다른 xidx에 복제하는 fallback 제공
+- fuzz 직전 필수 입력물 검증 수행
+
+### 5단계: `distance`
+
+distance instrumentation이 들어간 kernel을 다시 빌드합니다.
+
+무엇을 하나:
+
+- target function index 결정
+- distance directory 탐색
+- `Makefile.kcov` 작성
+- instrumented kernel rebuild
+- `bzImage`, `vmlinux` 복사
+
+이 단계 결과물이 실제 fuzz 단계의 kernel 이미지가 됩니다.
+
+### 6단계: `fuzz`
+
+최종적으로 `syz-manager`를 이용해 퍼징을 시작합니다.
+
+무엇을 하나:
+
+- fuzz 입력물 검증
+- syscall 이름 정규화
+- manager config 생성
+- instrumented kernel로 VM 부팅
+- `syz-manager` 실행
+
+추가로 현재 runner는 일반 fuzz 모드에서 HTTP 포트를 동적으로 할당합니다. 그래서 여러 CVE를 연속 또는 병렬로 확인할 때 `address already in use` 충돌이 줄어듭니다.
+
+## CVE를 어떻게 자동으로 가져오는가
+
+`new` 모드에서 `--commit`, `--function`, `--file` 중 하나라도 빠지면 `cve_resolver.py`가 동작합니다.
+
+resolver는 fix commit을 다음 순서로 찾습니다.
+
+1. Linux kernel CVE list
+   `git.kernel.org/pub/scm/linux/security/vulns.git`
+2. NVD API
+   `services.nvd.nist.gov`
+3. GitHub commit search
+   `api.github.com`
+
+그 다음 다음 순서로 메타데이터를 만듭니다.
+
+1. fix commit patch를 가져옴
+2. patch에서 가장 유력한 `.c` 파일을 찾음
+3. hunk header를 보고 가장 유력한 함수명을 추출
+4. 기본적으로 `fix_commit~1`을 vulnerable commit으로 사용
+
+왜 `Fixes:` 태그 대신 `fix~1`을 쓰는가:
+
+- `Fixes:`는 원래 버그를 도입한 아주 오래된 commit을 가리키는 경우가 많음
+- shallow fetch나 빠른 실험 환경에서 가져오기 어려울 수 있음
+- `fix~1`은 가장 최근의 vulnerable state라 one-day reproduction에 더 실용적임
+
+### CVE만 넣고 자동 추론하는 예시
 
 ```bash
 python3 run_hunt.py -j 8 -uptime 24 new --cve CVE-2025-99999
 ```
 
-This will attempt to infer:
+이 경우 runner는 가능한 범위에서 다음을 자동으로 추론합니다.
 
-- `commit`
-- `function`
-- `file`
+- checkout commit
+- target function
+- target file
 
-Then the pipeline continues normally.
+## pre-fix 재현과 post-fix 검증
 
-## Pre-Fix vs Post-Fix Runs
+기본 `new --cve ...`는 vulnerable kernel 기준으로 돌립니다.
 
-By default, `new --cve ...` runs in "reproduce on vulnerable kernel" mode:
+- checkout 대상은 기본적으로 `fix_commit~1`
 
-- checkout is the vulnerable revision, usually `fix_commit~1`
+반대로 `--verify-patch`를 주면 fixed kernel 기준 검증 모드가 됩니다.
 
-If you pass `--verify-patch`, the checkout switches to the fixed commit instead:
+- checkout 대상은 실제 fix commit
 
-- checkout is the actual fix commit
-
-This is useful when you want to confirm that the bug no longer reproduces after the patch.
-
-Example:
+예시:
 
 ```bash
 python3 run_hunt.py new \
@@ -276,34 +388,45 @@ python3 run_hunt.py new \
   --verify-patch
 ```
 
-## LLM-Assisted Syscall Selection
+이 모드는 "패치 후에는 정말로 재현이 사라지는가"를 빠르게 검증하고 싶을 때 유용합니다.
 
-One of the main problems in one-day CVE hunting is not just finding the right target function. It is generating a decent initial callfile that gives the fuzzer a realistic path toward the vulnerable state.
+## LLM call을 어떻게 활용하는가
 
-`run_hunt.py` has two layers for this.
+신규 CVE hunting에서 가장 어려운 부분 중 하나는 "어떤 syscall 조합이 이 함수까지 가는가"입니다. target function을 안다고 해서 바로 좋은 callfile이 나오는 것은 아닙니다.
 
-### Layer 1. Heuristic syscall guessing
+현재 runner는 이 부분에 두 개의 레이어를 둡니다.
 
-`guess_syscalls(file_path)` maps source-file paths to rough syscall families.
+### 1. heuristic syscall 추정
 
-Examples:
+`guess_syscalls(file_path)`는 source file path를 보고 대략적인 syscall family를 고릅니다.
+
+예:
 
 - `net/vmw_vsock/...` -> `connect$vsock_stream`
 - `kernel/bpf/...` -> `bpf$PROG_LOAD`
-- generic `fs/...` -> `openat`
+- `fs/...` -> `openat`
 
-This is cheap, deterministic, and works as a fallback.
+장점:
 
-### Layer 2. LLM syscall suggestion
+- 빠름
+- deterministic
+- LLM이 없어도 동작
 
-`llm_analyze_cve()` builds a prompt using:
+단점:
+
+- coarse-grained
+- 세부 variant를 잘못 고를 수 있음
+
+### 2. LLM 기반 syscall 제안
+
+`llm_analyze_cve()`는 다음 정보를 묶어 prompt를 만듭니다.
 
 - CVE ID
 - kernel commit
 - target function
 - file path
 
-It then asks the local `claude` CLI for JSON of the form:
+그리고 로컬 `claude` CLI에 JSON만 반환하도록 요청합니다. 기대 형식은 다음과 같습니다.
 
 ```json
 {
@@ -316,32 +439,49 @@ It then asks the local `claude` CLI for JSON of the form:
 }
 ```
 
-The LLM is expected to propose:
+의도는 다음과 같습니다.
 
-- 1 to 3 target syscalls
-- 3 to 6 related setup syscalls
-- exact syzkaller syscall names
+- 1~3개의 핵심 target syscall 제안
+- 각 target에 대해 3~6개의 관련 setup syscall 제안
+- syzkaller naming을 정확히 맞춘 결과 생성
 
-If the LLM call fails, times out, or returns bad JSON, the runner falls back to the heuristic mapping.
+만약 LLM 호출이 실패하거나:
 
-### Syscall normalization layer
+- timeout
+- JSON 파싱 실패
+- CLI 미설치
+- 비정상 종료
 
-Even when the LLM or heuristics are directionally correct, the names may not exactly match the syzkaller descriptions shipped in `syzdirect_fuzzer/sys/linux/gen/amd64.go`.
+이 경우 runner는 자동으로 heuristic fallback을 사용합니다.
 
-The runner therefore normalizes generated names before fuzzing. This absorbs common mismatches such as:
+즉, LLM은 있으면 더 좋고, 없어도 전체 파이프라인이 멈추지는 않게 설계합니다.
 
-- `io_uring_register` -> a concrete syzkaller variant
-- `connect$vsock` -> `connect$vsock_stream`
-- `bind$vsock` -> `bind$vsock_stream`
-- MPTCP-adjacent names into actual supported socket and operation combinations
+## syscall name normalization이 왜 필요한가
 
-This step is important because otherwise the fuzz stage can appear to run while the target call is silently unknown or disabled.
+LLM이든 heuristic이든 대략 맞는 방향을 잡아도 syzkaller가 실제로 아는 syscall 이름과 조금만 어긋나면 target call은 바로 unusable 상태가 됩니다.
 
-## How to Stop, Resume, and Restart From the Middle
+예를 들어 다음과 같은 문제가 생길 수 있습니다.
 
-The pipeline is intentionally stage-oriented.
+- `io_uring_register`
+- `connect$vsock`
+- `bind$vsock`
+- `connect$mptcp`
+- `setsockopt$mptcp`
 
-You can restart from a specific stage with `--from-stage`:
+이 이름들이 사람이 보기엔 맞아 보여도, syzkaller descriptions 기준으로는 정확한 variant가 아니어서 `unknown input call`로 빠질 수 있습니다.
+
+그래서 runner는 fuzz 직전에 syscall 이름을 실제 syzkaller 정의 기준으로 정규화합니다. 이 단계는 다음 문제를 막기 위해 매우 중요합니다.
+
+- target call이 disable되었는데 로그만 대충 움직이는 상황
+- fuzz는 도는 것처럼 보이지만 실제 목표 syscall은 한 번도 호출되지 않는 상황
+
+## 중간에 멈추고 다시 시작하는 방법
+
+이 프로젝트는 한 번에 끝까지 달리는 스크립트가 아니라, stage 기반으로 끊어서 운영하는 것을 전제로 합니다.
+
+### `--from-stage`
+
+아래처럼 특정 stage부터 재시작할 수 있습니다.
 
 ```bash
 python3 run_hunt.py new \
@@ -352,7 +492,7 @@ python3 run_hunt.py new \
   --from-stage distance
 ```
 
-Valid stages are:
+가능한 stage:
 
 - `source`
 - `bitcode`
@@ -361,56 +501,64 @@ Valid stages are:
 - `distance`
 - `fuzz`
 
-This is useful when:
+이 기능이 유용한 상황:
 
-- source checkout and build are already done
-- analysis succeeded and you only want to rebuild distance
-- fuzzing failed and you only want to re-enter the last stage
+- source checkout과 build는 이미 끝났음
+- target 분석만 다시 하고 싶음
+- distance kernel은 이미 있고 fuzz만 다시 하고 싶음
+- callfile을 수동 수정한 뒤 fuzz stage만 반복하고 싶음
 
-## State Files
+## state 파일과 중간 상태 추적
 
-Each `new` run writes a state manifest under:
+`new` 모드 실행 시 state manifest가 다음 위치에 남습니다.
 
 ```text
 <workdir>/state/case_0.json
 ```
 
-The state file records:
+여기에는 다음 정보가 들어갑니다.
 
 - CVE
 - commit
 - function
 - file
 - config
-- last stage
+- last_stage
 - phase
-- key artifact paths
-- last error, if any
+- 주요 artifact 경로
+- 마지막 error 메시지
 
-Typical `phase` values are:
+대표적인 `phase` 값:
 
 - `initialized`
 - `running`
 - `completed`
 - `failed`
 
-This is useful for:
+이 파일은 다음 용도로 쓸 수 있습니다.
 
-- resumability
-- debugging failed runs
-- external orchestration that wants to monitor pipeline progress
+- 어떤 stage에서 멈췄는지 확인
+- 외부 orchestration에서 진행률 추적
+- 장시간 fuzz가 실패했을 때 원인 기록 확인
+- 사람이 수동介入하기 전에 현재 상태 파악
 
-## Agent Loop: Using LLM/Agents to Strengthen Fuzzing Mid-Run
+## 퍼징 중간에 멈춰서 강화하는 방법: Agent Loop
 
-The optional agent loop is the part that makes this repository more than a one-shot launcher.
+이 저장소에서 중요한 차별점 중 하나가 agent loop입니다.
 
-When enabled, the flow becomes:
+기본 퍼징은 단순합니다.
 
 ```text
-fuzz -> assess health -> triage failure -> enhance callfile -> fuzz again
+fuzz -> 끝
 ```
 
-You enable it with:
+agent loop를 켜면 흐름이 다음처럼 바뀝니다.
+
+```text
+fuzz -> health 평가 -> triage -> callfile 강화 -> 다시 fuzz
+```
+
+사용 예시:
 
 ```bash
 python3 run_hunt.py new \
@@ -419,176 +567,213 @@ python3 run_hunt.py new \
   --function vuln_func \
   --file net/core/sock.c \
   --agent-rounds 3 \
+  --agent-window 300 \
   --agent-uptime 6
 ```
 
-Meaning:
+의미:
 
-- run up to 3 rounds
-- each round fuzzes for 6 hours
-- between rounds, analyze the result and mutate the callfile if needed
+- 최대 3라운드 반복
+- 각 라운드는 6시간 퍼징
+- 라운드 사이에 health 평가와 callfile 강화 수행
 
-### Round structure
+### 라운드 내부 흐름
 
-For each round:
+각 라운드는 다음 순서로 진행됩니다.
 
-1. run fuzzing and capture manager logs and metrics
-2. check whether crashes were found
-3. assess health from execution and coverage movement
-4. classify failure into an R-class
-5. call the appropriate agent to improve the callfile
-6. write the enhanced callfile and continue to the next round
+1. 현재 callfile로 fuzz
+2. crash가 났는지 확인
+3. metrics와 manager log를 읽어 health 평가
+4. 실패 유형을 R1/R2/R3로 분류
+5. 분류에 맞는 agent를 호출해 callfile 강화
+6. 강화된 callfile로 다음 라운드 진행
 
-### Health assessment
+### health는 무엇으로 평가하는가
 
-The loop scores the round using:
+현재 agent loop는 대략 다음 지표를 봅니다.
 
-- execution growth
-- coverage growth
-- crash count
-- fatal log markers such as "all target calls are disabled"
+- execution 증가량
+- coverage 증가량
+- crash 증가량
+- `"all target calls are disabled"` 같은 치명 로그
 
-The round is then treated as one of:
+그 결과 상태를 대략 이렇게 분류합니다.
 
 - `healthy`
 - `stagnant`
 - `fatal`
 
-### Triage classes
+### R1 / R2 / R3는 무엇인가
 
-The current logic uses three broad failure classes.
+#### R1
 
-#### `R1`
+의미:
 
-Meaning:
+- syscall family 자체를 잘못 골랐을 가능성
+- target call이 실제로 runnable하지 않음
+- 아무것도 제대로 실행되지 않음
 
-- wrong syscall family
-- target call never actually becomes runnable
-- all target calls disabled
-- nothing meaningful executed
+징후:
 
-Typical symptom:
+- 실행 수 증가가 거의 없음
+- target call disabled
 
-- zero progress or immediate disablement
+대응:
 
-Action:
+- 다른 related syscall 후보를 더 넣거나, target syscall 후보 자체를 재구성
 
-- broaden or replace related syscalls
+#### R2
 
-#### `R2`
+의미:
 
-Meaning:
+- syscall 방향은 맞을 수 있음
+- 하지만 parameter 또는 object generation이 틀림
 
-- syscall family may be right
-- parameter or object generation is wrong
+징후:
 
-Typical symptom:
+- 로그에 `EINVAL`, `EFAULT`가 과도하게 많음
 
-- repeated `EINVAL` or `EFAULT`
+대응:
 
-Action:
+- 더 적절한 object setup 또는 parameter synthesis 필요
 
-- synthesize better object setup or parameter scaffolding
+#### R3
 
-#### `R3`
+의미:
 
-Meaning:
+- 실행은 되는데 coverage나 진전이 멈춤
+- dependency chain 또는 context syscall이 부족함
 
-- executions happen
-- but coverage or depth toward the target stalls
-- likely missing dependency/context syscalls
+징후:
 
-Typical symptom:
+- 실행 수는 올라가는데 coverage가 안 오름
 
-- lots of execution, no meaningful movement
+대응:
 
-Action:
+- 관련 syscall을 더 붙여 call sequence를 풍부하게 만듦
 
-- augment the syscall chain with more related setup/context calls
+### 어떤 agent를 붙이는가
 
-### Which agent is called
+현재 매핑은 다음과 같습니다.
 
-Current mapping:
-
-- `R1` or `R3` -> `RelatedSyscallAgent`
+- `R1` 또는 `R3` -> `RelatedSyscallAgent`
 - `R2` -> `ObjectSynthesisAgent`
 
-The agents are imported from `source/agent/`, which is expected to exist in a larger local environment. This trimmed repository documents the interface points, but the actual agent implementations are not bundled here.
+즉:
 
-### What "stop in the middle and strengthen fuzzing" means
+- syscall 체인 자체가 부족하거나 틀렸으면 관련 syscall을 늘리는 쪽
+- object/parameter가 문제면 object synthesis 쪽
 
-Operationally, this repository supports that idea in two ways:
+주의:
 
-1. structured stopping between stages via `--from-stage`
-2. structured stopping between fuzz rounds via the agent loop
+이 저장소는 `run_hunt.py`에 연결되는 인터페이스를 설명하는 최소 번들이고, 실제 `source/agent/` 구현 전체는 포함하지 않습니다. 더 큰 로컬 환경에서 agent 모듈이 존재할 것을 가정합니다.
 
-That means you can:
+## "중간에 멈춰서 퍼징을 강화한다"는 말의 실제 의미
 
-- stop after `target` and inspect or replace the callfile manually
-- stop after `distance` and only relaunch fuzz later
-- let the agent loop run multiple short fuzz rounds instead of one long blind run
-- inspect the enhanced callfile between rounds and decide whether to continue
+운영적으로는 두 레벨이 있습니다.
 
-This is a better fit for CVE hunting than a single 24-hour fuzz launch with no feedback loop.
+### 레벨 1: stage 단위 중단
 
-## Fuzz Inputs and Why They Matter
+예:
 
-Before fuzzing, the runner validates:
+- `target`까지 돌리고 callfile을 사람이 직접 수정
+- 그 뒤 `--from-stage distance` 또는 `--from-stage fuzz`로 재시작
 
-- `target_functions_info.txt`
-- `inp_<xidx>.json` callfiles
-- instrumented `bzImage`
+### 레벨 2: fuzz round 단위 중단
 
-If these are missing or empty, the runner now tries to repair them instead of silently continuing into a useless fuzz phase.
+예:
 
-This matters because one of the easiest ways to waste a day is:
+- 24시간 한 번에 돌리지 않고
+- 4시간 또는 6시간씩 나눠서
+- 각 라운드 사이에 결과를 보고 더 나은 syscall template로 교체
 
-- target analysis prints something that looks plausible
-- `tfinfo` ends up empty
-- `syz-manager` never really runs the intended target call
-- logs keep moving but the target path is effectively dead
+이 방식은 신규 CVE hunting에 훨씬 현실적입니다. 처음 만든 callfile이 완벽할 가능성은 낮기 때문입니다.
 
-The wrapper explicitly guards against this.
+## 실제로 추가된 방어 로직
 
-## Runtime Prerequisites
+이 저장소의 runner는 신규 CVE 자동화를 위해 다음 방어 로직을 추가했습니다.
 
-At minimum, you need:
+- checkout 전에 commit 존재 여부 검증
+- 없는 commit object는 fetch 후 재검증
+- 그래도 없으면 stage1에서 즉시 명확하게 실패
+- `interface_generator` 실패 시 문제 `.llbc` quarantine
+- quarantine 파일 재스캔 방지 manifest 유지
+- `template_config` 자동 보장
+- 비어 있는 `target_functions_info.txt` 자동 복구
+- callfile이 없거나 비면 재생성
+- 필요 시 xidx 0 callfile을 다른 xidx에 복제
+- fuzz 전 필수 입력물 검증
+- syscall 이름 normalization
+- 일반 fuzz 모드에서 HTTP 포트 자동 할당
+- `state/case_0.json`에 진행 상태와 오류 저장
 
-- Python 3
-- a Linux build environment capable of compiling kernels with Clang/LLVM
-- QEMU/KVM-compatible runtime assets
-- a VM image
-- an SSH private key usable by the guest
+## 실제 실행 예시
 
-Useful environment variables:
+다음은 실제로 확인한 `fuzz` stage 실행 예시입니다.
+
+명령:
 
 ```bash
-export SYZDIRECT_RUNTIME=/path/to/runtime
-export SYZDIRECT_VM_IMAGE=/path/to/stretch.img
-export SYZDIRECT_SSH_KEY=/path/to/stretch.id_rsa
+timeout 120 python3 run_hunt.py -j 1 -uptime 1 -fuzz-rounds 1 -workdir ./workdir new \
+  --cve CVE-2026-23126 \
+  --commit b97d5eedf4976cc94321243be83b39efe81a0e15 \
+  --function nsim_bpf_destroy_prog \
+  --file drivers/net/netdevsim/netdevsim.c \
+  --from-stage fuzz
 ```
 
-Depending on your environment, you may also need:
+확인된 핵심 로그:
 
-- a local Linux repo template for faster cloning
-- the `claude` CLI if you want LLM-assisted syscall generation
-- network access for CVE auto-resolution
+```text
+serving http on http://0.0.0.0:2346
+serving rpc on tcp://[::]:35303
+booting test machines...
+wait for the connection from test machine...
+VMs 1, executed 8, cover 293, signal 363/0, crashes 0, repro 0
+VMs 1, executed 363, cover 830, signal 957/1493, crashes 0, repro 0
+VMs 1, executed 2386, cover 831, signal 960/1849, crashes 0, repro 0
+```
 
-## Recommended Workflows
+의미:
 
-### Fast path: CVE only
+- manager가 실제로 떴음
+- VM 부팅과 guest 연결이 됨
+- execution과 coverage가 증가했음
+- 최소한 "퍼징이 실제로 돌고 있다"는 점은 확인됨
+
+또 다른 실제 확인 포인트:
+
+- `CVE-2025-21655`는 coverage 증가까지 확인
+- `CVE-2025-21756`, `CVE-2025-40257`는 unknown syscall 문제는 줄었지만 일부는 `got no coverage`로 멈춤
+
+이것은 runner 인프라가 망가졌다는 뜻이 아니라, 각 CVE별 callfile 품질이나 kernel/runtime 상태가 여전히 병목일 수 있음을 의미합니다.
+
+## 병렬 실행과 포트 문제
+
+퍼징을 여러 번 돌리다 보면 흔히 다음 문제가 납니다.
+
+```text
+bind: address already in use
+```
+
+원인은 `syz-manager` HTTP 포트를 고정으로 쓰기 때문입니다.
+
+이 runner는 일반 fuzz 모드에서 빈 TCP 포트를 자동으로 잡아 config에 넣습니다. 따라서 여러 CVE를 연속으로 검증하거나 동시에 띄울 때 충돌 가능성이 줄어듭니다.
+
+## 추천 운영 시나리오
+
+### 시나리오 1: CVE만 먼저 넣어보기
 
 ```bash
 python3 run_hunt.py -j 8 -uptime 24 new --cve CVE-2025-99999
 ```
 
-Use this when:
+추천 상황:
 
-- the CVE is in kernel.org or NVD
-- the patch is parseable
-- you want the runner to infer as much as possible
+- 우선 자동 추론이 얼마나 되는지 보고 싶을 때
+- commit/function/file을 아직 사람이 정리하지 않았을 때
 
-### Controlled path: manual commit/function/file
+### 시나리오 2: 메타데이터는 수동으로 고정
 
 ```bash
 python3 run_hunt.py -j 8 -uptime 24 new \
@@ -598,13 +783,12 @@ python3 run_hunt.py -j 8 -uptime 24 new \
   --file net/core/sock.c
 ```
 
-Use this when:
+추천 상황:
 
-- the CVE resolver found the wrong function
-- the fix commit is non-mainline
-- the patch touches multiple files and you want to force a target
+- resolver가 여러 파일 중 잘못 고를 수 있을 때
+- function/file을 이미 사람이 더 정확히 알고 있을 때
 
-### Analysis-first path
+### 시나리오 3: analysis 이후부터 반복
 
 ```bash
 python3 run_hunt.py -j 8 new \
@@ -615,12 +799,12 @@ python3 run_hunt.py -j 8 new \
   --from-stage target
 ```
 
-Use this when:
+추천 상황:
 
-- source and bitcode already exist
-- you are iterating on target/callfile generation
+- source와 bitcode는 이미 있음
+- callfile 생성 전략만 여러 번 바꿔보고 싶음
 
-### Fuzz-strengthening path
+### 시나리오 4: agent loop로 템플릿 강화
 
 ```bash
 python3 run_hunt.py -j 8 -uptime 6 new \
@@ -633,40 +817,36 @@ python3 run_hunt.py -j 8 -uptime 6 new \
   --agent-uptime 6
 ```
 
-Use this when:
+추천 상황:
 
-- a single long fuzz run is too opaque
-- you want iterative refinement of the callfile
-- you expect the initial syscall chain to be incomplete
+- 처음 만든 callfile이 부정확할 가능성이 높음
+- 한 번에 24시간 돌리는 것보다 짧은 라운드로 조정하고 싶음
 
-## Current Practical Improvements Over a Plain SyzDirect Script
+## 필요한 실행 환경
 
-This wrapper already adds several defensive behaviors for fresh CVEs:
+최소한 다음은 필요합니다.
 
-- commit existence check before checkout
-- fetch missing commit objects automatically
-- clearer stage failure when a commit cannot be resolved locally
-- `interface_generator` retry with bad `.llbc` quarantine
-- persistent skip manifest for bad analysis files
-- auto-generation of missing `template_config`
-- auto-repair of missing or empty `target_functions_info.txt`
-- regeneration or replication of missing callfiles
-- syscall name normalization against real syzkaller names
-- dynamic HTTP port assignment in normal fuzz mode
-- state manifest recording for restart/debugging
+- Python 3
+- Clang/LLVM 기반 kernel build 환경
+- VM image
+- guest 접속용 SSH key
+- QEMU/KVM 기반 실행 환경
 
-## Limitations
+유용한 환경변수:
 
-Important limitations to understand up front:
+```bash
+export SYZDIRECT_RUNTIME=/path/to/runtime
+export SYZDIRECT_VM_IMAGE=/path/to/stretch.img
+export SYZDIRECT_SSH_KEY=/path/to/stretch.id_rsa
+```
 
-- this repository still depends on shipped SyzDirect binaries rather than rebuilding every component from source
-- CVE auto-resolution is best-effort; some CVEs still need manual `--commit`, `--function`, or `--file`
-- LLM syscall selection is only as good as the local model/tooling you provide
-- some kernels still fail in ways the wrapper cannot repair, especially low-level bitcode or runtime/coverage issues
-- the agent loop expects external agent implementations under `source/agent/`
-- normal fuzz mode uses dynamic HTTP ports, but other parts of a larger orchestration stack may still need their own port hygiene
+상황에 따라 추가로 필요할 수 있는 것:
 
-## Minimal Quick Start
+- 빠른 clone을 위한 로컬 Linux template repo
+- LLM 기반 syscall 추론을 원할 경우 `claude` CLI
+- CVE 자동 해석을 위한 네트워크 접근
+
+## 빠른 시작
 
 ```bash
 git clone https://github.com/whysocscs/Syzagent.git
@@ -683,7 +863,7 @@ python3 run_hunt.py -j 8 -uptime 24 new \
   --file drivers/net/netdevsim/netdevsim.c
 ```
 
-If you already have artifacts and only want to re-enter fuzz:
+이미 산출물이 있어서 fuzz만 다시 들어가고 싶다면:
 
 ```bash
 python3 run_hunt.py -j 8 -uptime 12 new \
@@ -694,8 +874,19 @@ python3 run_hunt.py -j 8 -uptime 12 new \
   --from-stage fuzz
 ```
 
-## Summary
+## 현재 한계
 
-If you only remember one thing, it should be this:
+미리 알고 있어야 할 제약도 있습니다.
 
-`Syzagent` is a CVE-oriented wrapper around SyzDirect that tries to turn a raw, newly disclosed Linux kernel CVE into a restartable, fuzzable hunting workflow, with optional LLM- and agent-assisted refinement when the first callfile is not good enough.
+- 이 저장소는 SyzDirect 바이너리를 최소 번들 형태로 싣고 있으며, 모든 것을 source부터 다시 빌드하는 구조는 아님
+- CVE auto-resolve는 best-effort이므로 일부 CVE는 `--commit`, `--function`, `--file`을 수동 지정해야 함
+- LLM syscall 추론의 품질은 로컬에서 사용하는 모델/CLI에 영향받음
+- 일부 kernel은 여전히 low-level bitcode 문제나 runtime coverage 문제를 일으킬 수 있음
+- agent loop는 외부 `source/agent/` 구현을 가정함
+- runner 인프라가 안정화되어도, 각 CVE의 callfile 품질 자체는 여전히 별도 개선 대상일 수 있음
+
+## 마지막으로
+
+이 저장소를 한 문장으로 요약하면 다음과 같습니다.
+
+`Syzagent`는 신규 Linux kernel CVE를 입력으로 받아, SyzDirect의 공식 구성요소를 이용해 재현 가능한 hunting pipeline을 자동으로 돌리고, 필요하면 LLM과 agent loop를 이용해 퍼징 입력을 중간에 강화할 수 있도록 만든 CVE 지향 래퍼입니다.
