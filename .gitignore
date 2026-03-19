@@ -1,0 +1,4 @@
+/source/syzdirect/Runner/workdir/
+/source/syzdirect/Runner/test_runs/
+/source/syzdirect/Runner/__pycache__/
+*.pyc
